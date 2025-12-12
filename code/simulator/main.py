@@ -14,16 +14,16 @@ latest_top_jpeg = None
 latest_lock = threading.Lock()
 
 # 车道/场景参数（作业要求）
-LANE_WIDTH = 4.5
+LANE_WIDTH = 3.5
 LANE_RIGHT_Y = -LANE_WIDTH  # 右车道中心 y = -4.5
 LANE_MID_Y = 0.0           # 中车道中心 y = 0
 LANE_LEFT_Y = LANE_WIDTH   # 左车道中心 y = +4.5
 
 # 车辆长度近似值（用于后续 IDM 等，先占位）
-VEH_LENGTH = 4.5
+VEH_LENGTH = 3.5
 
 # 选择用于构建直线路段的基础出生点索引（可根据需要调整）
-BASE_SPAWN_INDEX = 40
+BASE_SPAWN_INDEX = 100
 
 
 class CameraHTTPHandler(BaseHTTPRequestHandler):
@@ -111,14 +111,22 @@ def main():
     # 加长超时时间，方便加载新地图
     client.set_timeout(30.0)
 
-    # 使用一张较长的直线路网（Town03），不依赖 HD 额外地图包
+    # 选择地图（注意：不同 CARLA 安装/服务器可能不包含全部 TownXX）
+    map_name = "Town03"
     try:
-        world = client.load_world("Town03")
-        print("Loaded map: Town03")
+        world = client.load_world(map_name)
+        print("Loaded map:", map_name)
     except RuntimeError:
-        # 如本机缺少 Town03，则退回当前地图，仍可用直线坐标系近似
+        # 如服务器缺少该地图，则退回当前地图，仍可用直线坐标系近似
         world = client.get_world()
-        print("Warning: failed to load Town03, using current map:", world.get_map().name)
+        print(
+            f"Warning: failed to load {map_name}, using current map: {world.get_map().name}"
+        )
+        try:
+            maps = client.get_available_maps()
+            print("Available maps on server:", maps)
+        except Exception as e:
+            print("Failed to query available maps:", repr(e))
     original_settings = world.get_settings()
 
     av_vehicle = None
@@ -274,7 +282,7 @@ def main():
         while running and frame_count < 400:  # 跑约 20 秒
             frame_count += 1
 
-            control = carla.VehicleControl(throttle=0.5, steer=0.0)
+            control = carla.VehicleControl(throttle=5, steer=0.0)
             av_vehicle.apply_control(control)
 
             # HV：先用简单「匀速直行」占位，将来替换为 IDM 更新
