@@ -4,8 +4,9 @@
 > 作用：后续在本项目中继续实现、调试和写报告时，都优先参考本记录。
 
 ---
+cd /data1/daiyukun/小学一下/AutoDriving/AD_HW/carla_0.9.16
 ./CarlaUE4.sh -RenderOffScreen
-conda activate carla016
+conda activate drivevla
 python /data1/daiyukun/小学一下/AutoDriving/AD_HW/code/simulator/main.py
 ### 1. 作业核心要求总结
 

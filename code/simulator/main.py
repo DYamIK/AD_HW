@@ -1,19 +1,108 @@
 from __future__ import annotations
 
+import argparse
 import carla
+import json
+import os
 import queue
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import io
 
 import numpy as np
 from PIL import Image
 
+try:
+    # 可选：DriveVLA 回放策略（用于把 DriveVLA 推理输出接到 AV）
+    from drivevla_av import DriveVLAReplayPolicy, DriveVLALivePolicy
+except Exception:
+    DriveVLAReplayPolicy = None  # type: ignore
+    DriveVLALivePolicy = None  # type: ignore
+
+try:
+    # 可选：通用多模态大模型（OpenAI-compatible VLM）在线决策
+    from vlm_av import OpenAICompatibleVLMLivePolicy, VLMActionStep
+except Exception:
+    OpenAICompatibleVLMLivePolicy = None  # type: ignore
+    VLMActionStep = None  # type: ignore
+
+
+def _str2bool(val: str) -> bool:
+    return val.strip().lower() in ("1", "true", "t", "yes", "y")
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="CARLA AV scenario with optional VLM/DriveVLA control."
+    )
+    parser.add_argument(
+        "--av-mode",
+        default=os.environ.get("AV_MODE", "vlm_live").strip() or "vlm_live",
+        choices=["cruise", "drivevla_replay", "drivevla_live", "vlm_live"],
+        help="选择 AV 控制模式（默认 vlm_live，或 cruise/drivevla_live/vlm_live）。",
+    )
+    parser.add_argument(
+        "--vlm-model",
+        default=os.environ.get("VLM_MODEL", "").strip() or "Qwen/Qwen3-VL-2B-Instruct-FP8",
+        help="VLM 模型名（OpenAI-compatible）。",
+    )
+    parser.add_argument(
+        "--vlm-api-base",
+        default=os.environ.get("VLM_API_BASE", "").strip() or "http://localhost:8000/v1",
+        help="VLM 接口 base URL，例如 http://localhost:8000/v1。",
+    )
+    parser.add_argument(
+        "--vlm-api-key",
+        default=os.environ.get("VLM_API_KEY", "EMPTY").strip() or "EMPTY",
+        help="VLM API Key（默认 EMPTY）。",
+    )
+    parser.add_argument(
+        "--vlm-use-top",
+        type=int,
+        default=1 if _str2bool(os.environ.get("VLM_USE_TOP", "0")) else 1,
+        choices=[0, 1],
+        help="是否把鸟瞰图也送入 VLM（0/1）。",
+    )
+    parser.add_argument(
+        "--print-av-action",
+        type=int,
+        default=1 if _str2bool(os.environ.get("PRINT_AV_ACTION", "0")) else 1,
+        choices=[0, 1],
+        help="是否打印 AV 动作日志（0/1）。",
+    )
+    parser.add_argument(
+        "--vlm-timeout-s",
+        type=float,
+        default=float(os.environ.get("VLM_TIMEOUT_S", "2")),
+        help="VLM 请求超时时间（秒）。",
+    )
+    parser.add_argument(
+        "--vlm-min-interval-s",
+        type=float,
+        default=float(os.environ.get("VLM_MIN_INTERVAL_S", "0.1")),
+        help="VLM 最小调用间隔（秒）。",
+    )
+    parser.add_argument(
+        "--vlm-max-image-side",
+        type=int,
+        default=int(os.environ.get("VLM_MAX_IMAGE_SIDE", "512")),
+        help="送入 VLM 的图像最大边（像素）。",
+    )
+    parser.add_argument(
+        "--vlm-memory-steps",
+        type=int,
+        default=int(os.environ.get("VLM_MEMORY_STEPS", "3")),
+        help="VLM 记忆步数：把最近 N 步决策文本拼进下一次提示（0 表示关闭）。",
+    )
+    return parser.parse_args()
+
 
 # HTTP 相机最新一帧 JPEG（前向视角 & 鸟瞰视角）
 latest_front_jpeg = None
 latest_top_jpeg = None
 latest_speed_text = "No data yet"
+latest_vlm_text = "No VLM data yet"
 latest_lock = threading.Lock()
 status_lock = threading.Lock()
 
@@ -30,7 +119,7 @@ VEH_LENGTH = 4.5
 # IDM 目标速度（120 km/h）
 V_DESIRED = 130/3.6
 # AV 初始速度（80 km/h）
-AV_INIT_SPEED = 80 / 3.6
+AV_INIT_SPEED = 120 / 3.6
 
 # 三种驾驶风格参数
 IDM_STYLES = {
@@ -41,18 +130,19 @@ IDM_STYLES = {
 
 
 def lane_index_from_d(d: float) -> int:
-    """根据横向偏移近似车道索引：左=+1，中=0，右=-1。"""
-    return int(round((d + LANE_SHIFT) / LANE_WIDTH))
+    """根据横向偏移(shifted-d)近似车道索引：左=+1，中=0，右=-1。"""
+    return int(round(d / LANE_WIDTH))
 
 
 class KinematicState:
     """只存储纵向位置/速度/车道，用于前车搜索。"""
 
-    __slots__ = ("s", "v", "lane")
+    __slots__ = ("s", "v", "d", "lane")
 
-    def __init__(self, s: float, v: float, lane: int):
+    def __init__(self, s: float, v: float, d: float, lane: int):
         self.s = s
         self.v = v
+        self.d = d  # shifted-d（用于 make_transform）
         self.lane = lane
 
 
@@ -72,7 +162,7 @@ class IDMVehicle:
         self.name = name
         self.actor = actor
         self.s = s0
-        self.d = d0
+        self.d = d0  # shifted-d（与 make_transform 入参一致）
         self.v = v0
         self.a = 0.0
         self.lane = lane_index_from_d(d0)
@@ -164,11 +254,16 @@ class CameraHTTPHandler(BaseHTTPRequestHandler):
         <h2>Speeds (km/h) & Acc (m/s^2)</h2>
         <pre id="speeds">Loading...</pre>
       </div>
+      <div class="panel">
+        <h2>VLM Output (latest)</h2>
+        <pre id="vlm">Loading...</pre>
+      </div>
     </div>
     <script>
       const imgFront = document.getElementById('cam_front');
       const imgTop = document.getElementById('cam_top');
       const speedsBox = document.getElementById('speeds');
+      const vlmBox = document.getElementById('vlm');
       setInterval(() => {
         const t = Date.now();
         imgFront.src = '/image_front?t=' + t;
@@ -177,6 +272,10 @@ class CameraHTTPHandler(BaseHTTPRequestHandler):
           .then(r => r.text())
           .then(txt => { speedsBox.textContent = txt || 'No data'; })
           .catch(() => { speedsBox.textContent = 'No data'; });
+        fetch('/vlm?t=' + t)
+          .then(r => r.text())
+          .then(txt => { vlmBox.textContent = txt || 'No data'; })
+          .catch(() => { vlmBox.textContent = 'No data'; });
       }, 100);
     </script>
   </body>
@@ -225,11 +324,21 @@ class CameraHTTPHandler(BaseHTTPRequestHandler):
             self.wfile.write(data.encode("utf-8"))
             return
 
+        if self.path.startswith("/vlm"):
+            with status_lock:
+                data = latest_vlm_text
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Cache-Control", "no-cache")
+            self.end_headers()
+            self.wfile.write(data.encode("utf-8"))
+            return
+
         self.send_response(404)
         self.end_headers()
 
 
-def main():
+def main(args: argparse.Namespace):
     client = carla.Client("localhost", 2000)
     # 加长超时时间，方便加载新地图
     client.set_timeout(30.0)
@@ -428,11 +537,78 @@ def main():
         frame_count = 0
         dt = settings.fixed_delta_seconds or 0.05
 
+        # AV 控制模式（可通过命令行或环境变量配置）：
+        # - cruise：简易巡航（默认）
+        # - drivevla_replay：读取 DriveVLA 推理输出动作并回放（需要 DRIVEVLA_ACTIONS 路径）
+        # - drivevla_live：OpenDriveVLA 在线推理（需要 OpenDriveVLA 依赖/权重）
+        # - vlm_live：通用多模态大模型在线决策（OpenAI-compatible /v1/chat/completions）
+        av_mode = args.av_mode
+        drivevla_policy = None
+        drivevla_pending_step = None
+        vlm_policy = None
+        vlm_pending_step = None
+        if av_mode == "drivevla_replay":
+            if DriveVLAReplayPolicy is None:
+                raise RuntimeError("AV_MODE=drivevla_replay 但无法导入 drivevla_av.py（检查文件是否存在/依赖）")
+            drivevla_actions = os.environ.get("DRIVEVLA_ACTIONS", "").strip()
+            if not drivevla_actions:
+                raise RuntimeError(
+                    "AV_MODE=drivevla_replay 需要设置环境变量 DRIVEVLA_ACTIONS 指向 DriveVLA 输出 json 文件或目录"
+                )
+            # 默认取 horizon 第 0 个 waypoint
+            drivevla_policy = DriveVLAReplayPolicy(drivevla_actions, horizon_index=0)
+        elif av_mode == "drivevla_live":
+            if DriveVLALivePolicy is None:
+                raise RuntimeError("AV_MODE=drivevla_live 但无法导入 DriveVLALivePolicy（检查 OpenDriveVLA 依赖/路径）")
+            # OpenDriveVLA 根目录（默认使用本仓库下的 ./OpenDriveVLA）
+            default_root = os.path.abspath(
+                os.path.join(os.path.dirname(__file__), "..", "..", "..", "OpenDriveVLA")
+            )
+            opendrivevla_root = os.environ.get("OPENDRIVEVLA_ROOT", default_root).strip()
+            # checkpoint/模型路径：可以是本地路径，也可以是 HuggingFace repo id（如 OpenDriveVLA/OpenDriveVLA-0.5B）
+            default_model = os.path.join(opendrivevla_root, "checkpoints", "DriveVLA-Qwen2.5-0.5B-Instruct")
+            model_path = os.environ.get("OPENDRIVEVLA_MODEL_PATH", default_model).strip()
+            min_interval_s = float(os.environ.get("OPENDRIVEVLA_MIN_INTERVAL_S", "0.5"))
+            use_bf16 = os.environ.get("OPENDRIVEVLA_BF16", "1").strip() not in ("0", "false", "False")
+            device = os.environ.get("OPENDRIVEVLA_DEVICE", "cuda").strip()
+            drivevla_policy = DriveVLALivePolicy(
+                opendrivevla_root=opendrivevla_root,
+                model_path=model_path,
+                device=device,
+                use_bf16=use_bf16,
+                min_interval_s=min_interval_s,
+                # 默认开启“视觉+规划”：会构造最小 uniad_data 并使用 <scene>/<track>/<map> token 注入视觉特征
+                use_images=os.environ.get("OPENDRIVEVLA_USE_VISION", "1").strip() not in ("0", "false", "False"),
+            )
+            print(drivevla_policy)
+        elif av_mode == "vlm_live":
+            if OpenAICompatibleVLMLivePolicy is None:
+                raise RuntimeError("AV_MODE=vlm_live 但无法导入 vlm_av.py（检查 requests/Pillow 依赖）")
+            # 参考 OpenEQA/infer.py：base_url 可按 model_name 自动选择；也可显式指定 VLM_API_BASE
+            api_base = args.vlm_api_base
+            api_key = args.vlm_api_key
+            model = args.vlm_model
+            timeout_s = args.vlm_timeout_s
+            min_interval_s = args.vlm_min_interval_s
+            max_image_side = args.vlm_max_image_side
+            vlm_policy = OpenAICompatibleVLMLivePolicy(
+                api_base=api_base,
+                model=model,
+                api_key=api_key,
+                timeout_s=timeout_s,
+                min_interval_s=min_interval_s,
+                max_image_side=max_image_side,
+                memory_steps=int(args.vlm_memory_steps),
+            )
+            print(vlm_policy)
+
         def get_av_state() -> KinematicState | None:
             if av_vehicle is None or not av_vehicle.is_alive:
                 return None
             tf = av_vehicle.get_transform()
             s_val, d_val = world_to_sd(tf.location)
+            # d_val 是 world-d，make_transform 的入参是 shifted-d，需要加上 LANE_SHIFT 做对齐
+            d_shifted = d_val + LANE_SHIFT
             vel = av_vehicle.get_velocity()
             v_long = float(
                 vel.x * forward_np[0]
@@ -442,11 +618,15 @@ def main():
             return KinematicState(
                 s=s_val,
                 v=max(v_long, 0.0),
-                lane=lane_index_from_d(d_val),
+                d=d_shifted,
+                lane=lane_index_from_d(d_shifted),
             )
 
         def log_vehicle_speeds(
-            av_state: KinematicState | None, av_acc: float, frame_idx: int
+            av_state: KinematicState | None,
+            av_acc: float,
+            frame_idx: int,
+            action_step=None,
         ) -> None:
             entries: list[str] = []
             if av_state:
@@ -455,8 +635,16 @@ def main():
                 entries.append("AV:NA(a:NA)")
             for hv in hv_list:
                 entries.append(f"{hv.name}:{hv.v * 3.6:.2f}(a:{hv.a:.2f})")
-            line = " | ".join(entries)
-            print(f"[frame {frame_idx:03d}] speeds(km/h): " + line)
+            # 在状态面板上显示最新动作（如果有）
+            if action_step is not None:
+                try:
+                    entries.append(
+                        f"Action(dx,dy,dyaw): {action_step.dx:+.2f}, {action_step.dy:+.2f}, {action_step.dyaw:+.3f}"
+                    )
+                except Exception:
+                    # 容错：action_step 不是预期类型时不影响主循环
+                    pass
+
             text = "Speeds/Acc (km/h, m/s^2)\n" + "\n".join(entries)
             with status_lock:
                 global latest_speed_text
@@ -467,7 +655,13 @@ def main():
         av_state_init = get_av_state()
         if av_state_init:
             av_prev_v = av_state_init.v
-        log_vehicle_speeds(av_state_init, 0.0, frame_count)
+        log_vehicle_speeds(av_state_init, 0.0, frame_count, action_step=None)
+
+        latest_pil_front: Image.Image | None = None
+        latest_pil_top: Image.Image | None = None
+        last_action_print_t = 0.0
+        print_action = bool(args.print_av_action)
+        print_action_interval_s = float(os.environ.get("PRINT_AV_ACTION_INTERVAL_S", "0.5"))
 
         while running and frame_count < 400:  # 跑约 20 秒
             frame_count += 1
@@ -478,15 +672,57 @@ def main():
                 av_acc = (av_state.v - av_prev_v) / dt
                 av_prev_v = av_state.v
 
-            # AV 简易巡航控制：保持期望速度 V_DESIRED
-            cur_v = av_state.v if av_state else 0.0
-            err_v = V_DESIRED - cur_v
-            throttle_cmd = np.clip(0.1 * err_v, 0.0, 0.7)
-            brake_cmd = np.clip(-0.2 * err_v, 0.0, 1.0)
-            control = carla.VehicleControl(
-                throttle=float(throttle_cmd), brake=float(brake_cmd), steer=0.0
-            )
-            av_vehicle.apply_control(control)
+            if av_mode == "drivevla_replay" and drivevla_policy is not None:
+                # 通过 set_transform 以“运动学回放”方式执行（最稳妥，先把链路打通）
+                step = drivevla_policy.step()
+                if step is not None and av_state is not None:
+                    # 将 DriveVLA 的相对 (dx,dy) 映射到本项目的 (s,d)
+                    new_s = av_state.s + step.dx
+                    new_d = av_state.d + step.dy
+                    av_vehicle.set_transform(make_transform(new_s, new_d))
+                    if print_action and (time.time() - last_action_print_t) >= print_action_interval_s:
+                        last_action_print_t = time.time()
+                        print(
+                            f"[frame {frame_count:03d}] AV action(replay): dx={step.dx:+.2f} dy={step.dy:+.2f} dyaw={step.dyaw:+.3f}"
+                        )
+                else:
+                    # 回放结束或无数据：保持不动
+                    pass
+            elif av_mode == "drivevla_live" and drivevla_policy is not None:
+                # 使用上一轮推理得到的动作（避免在同步 tick 内阻塞太久）
+                if drivevla_pending_step is not None and av_state is not None:
+                    new_s = av_state.s + drivevla_pending_step.dx
+                    new_d = av_state.d + drivevla_pending_step.dy
+                    av_vehicle.set_transform(make_transform(new_s, new_d))
+            elif av_mode == "vlm_live" and vlm_policy is not None:
+                # 使用上一轮 VLM 决策得到的动作（避免在同步 tick 内阻塞太久）
+                if vlm_pending_step is not None and av_state is not None:
+                    # 再做一层安全限幅：每步最多前进 3m、横向 1.5m
+                    dx = float(np.clip(vlm_pending_step.dx, 0.0, 3.0))
+                    dy = float(np.clip(vlm_pending_step.dy, -1.5, 1.5))
+                    new_s = av_state.s + dx
+                    new_d = av_state.d + dy
+                    av_vehicle.set_transform(make_transform(new_s, new_d))
+                else:
+                    # VLM 暂无输出：退化为巡航（避免车辆“卡住”）
+                    cur_v = av_state.v if av_state else 0.0
+                    err_v = V_DESIRED - cur_v
+                    throttle_cmd = np.clip(0.1 * err_v, 0.0, 0.7)
+                    brake_cmd = np.clip(-0.2 * err_v, 0.0, 1.0)
+                    control = carla.VehicleControl(
+                        throttle=float(throttle_cmd), brake=float(brake_cmd), steer=0.0
+                    )
+                    av_vehicle.apply_control(control)
+            else:
+                # AV 简易巡航控制：保持期望速度 V_DESIRED
+                cur_v = av_state.v if av_state else 0.0
+                err_v = V_DESIRED - cur_v
+                throttle_cmd = np.clip(0.1 * err_v, 0.0, 0.7)
+                brake_cmd = np.clip(-0.2 * err_v, 0.0, 1.0)
+                control = carla.VehicleControl(
+                    throttle=float(throttle_cmd), brake=float(brake_cmd), steer=0.0
+                )
+                av_vehicle.apply_control(control)
 
             # HV：IDM 纵向控制（车道固定）
             for hv in hv_list:
@@ -510,7 +746,13 @@ def main():
                 )
                 hv.step(dt, front_vehicle, make_transform)
 
-            log_vehicle_speeds(av_state, av_acc, frame_count)
+            # UI 上显示动作：优先显示 live 的 pending_step，其次显示 replay step（在 replay 分支已直接打印）
+            log_vehicle_speeds(
+                av_state,
+                av_acc,
+                frame_count,
+                action_step=(drivevla_pending_step if av_mode == "drivevla_live" else None),
+            )
 
             # 同步步进
             world.tick()
@@ -522,6 +764,7 @@ def main():
                 arr_f = arr_f.reshape((img_front.height, img_front.width, 4))
                 arr_f = arr_f[:, :, :3][:, :, ::-1]  # BGRA -> RGB
                 pil_f = Image.fromarray(arr_f)
+                latest_pil_front = pil_f
                 buf_f = io.BytesIO()
                 pil_f.save(buf_f, format="JPEG", quality=80)
                 with latest_lock:
@@ -536,6 +779,7 @@ def main():
                 arr_t = arr_t.reshape((img_top.height, img_top.width, 4))
                 arr_t = arr_t[:, :, :3][:, :, ::-1]  # BGRA -> RGB
                 pil_t = Image.fromarray(arr_t)
+                latest_pil_top = pil_t
                 buf_t = io.BytesIO()
                 pil_t.save(buf_t, format="JPEG", quality=80)
                 with latest_lock:
@@ -544,7 +788,72 @@ def main():
             except queue.Empty:
                 pass
 
-        print("Simulation with camera visualization finished.")
+            # drivevla_live：在拿到最新相机帧后做一次推理，供下一轮使用
+            if av_mode == "drivevla_live" and drivevla_policy is not None:
+                try:
+                    av_state_now = get_av_state()
+                    if av_state_now is not None and latest_pil_front is not None:
+                        drivevla_pending_step = drivevla_policy.step(
+                            front_pil_image=latest_pil_front,
+                            top_pil_image=latest_pil_top,
+                            speed_mps=av_state_now.v,
+                        )
+                        if (
+                            print_action
+                            and drivevla_pending_step is not None
+                            and (time.time() - last_action_print_t) >= print_action_interval_s
+                        ):
+                            last_action_print_t = time.time()
+                            print(
+                                f"[frame {frame_count:03d}] AV action(live): dx={drivevla_pending_step.dx:+.2f} "
+                                f"dy={drivevla_pending_step.dy:+.2f} dyaw={drivevla_pending_step.dyaw:+.3f}"
+                            )
+                except Exception as e:
+                    # 在线推理失败时退化为“保持上一次动作/不动作”
+                    drivevla_pending_step = None
+                    print("DriveVLA live inference failed:", repr(e))
+
+            # vlm_live：在拿到最新相机帧后做一次决策，供下一轮使用
+            if av_mode == "vlm_live" and vlm_policy is not None:
+                try:
+                    av_state_now = get_av_state()
+                    if av_state_now is not None and latest_pil_front is not None:
+                        use_top = bool(args.vlm_use_top)
+                        vlm_pending_step = vlm_policy.step(
+                            front_pil_image=latest_pil_front,
+                            top_pil_image=(latest_pil_top if use_top else None),
+                            speed_mps=av_state_now.v,
+                            lane=av_state_now.lane,
+                        )
+                        # 把模型返回内容写入网页面板（/vlm）
+                        if vlm_pending_step is not None:
+                            with status_lock:
+                                global latest_vlm_text
+                                latest_vlm_text = json.dumps(
+                                    {
+                                        "dx": float(vlm_pending_step.dx),
+                                        "dy": float(vlm_pending_step.dy),
+                                        "dyaw": float(vlm_pending_step.dyaw),
+                                        "reason": str(getattr(vlm_pending_step, "reason", "") or ""),
+                                    },
+                                    ensure_ascii=False,
+                                    indent=2,
+                                )
+                        if (
+                            print_action
+                            and vlm_pending_step is not None
+                            and (time.time() - last_action_print_t) >= print_action_interval_s
+                        ):
+                            last_action_print_t = time.time()
+                            print(
+                                f"[frame {frame_count:03d}] AV action(vlm): dx={vlm_pending_step.dx:+.2f} "
+                                f"dy={vlm_pending_step.dy:+.2f} dyaw={vlm_pending_step.dyaw:+.3f}"
+                            )
+                except Exception as e:
+                    vlm_pending_step = None
+                    print("VLM live inference failed:", repr(e))
+
+        print("*"*20,"仿真结束","*"*20)
 
     finally:
         # 停止相机并销毁 actor，恢复仿真设置
@@ -575,6 +884,7 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    parsed_args = parse_args()
+    main(parsed_args)
 
 
