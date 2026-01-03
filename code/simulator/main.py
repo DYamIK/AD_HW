@@ -7,6 +7,7 @@ import os
 import queue
 import threading
 import time
+from pathlib import Path
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import io
 
@@ -95,7 +96,60 @@ def parse_args() -> argparse.Namespace:
         default=int(os.environ.get("VLM_MEMORY_STEPS", "3")),
         help="VLM 记忆步数：把最近 N 步决策文本拼进下一次提示（0 表示关闭）。",
     )
+    parser.add_argument(
+        "--http-port",
+        type=int,
+        default=int(os.environ.get("HTTP_PORT", "8080")),
+        help="网页相机/状态面板端口（默认 8080）。端口冲突时可改为 8081 等。",
+    )
+    parser.add_argument(
+        "--record-mp4",
+        type=int,
+        default=int(os.environ.get("RECORD_MP4", "0")),
+        choices=[0, 1],
+        help="是否录制并保存 mp4 到 output/（0/1）。默认 0。",
+    )
+    parser.add_argument(
+        "--record-every-n",
+        type=int,
+        default=int(os.environ.get("RECORD_EVERY_N", "2")),
+        help="每 N 帧写入一次视频（降低体积）。默认 2。",
+    )
+    parser.add_argument(
+        "--record-max-side",
+        type=int,
+        default=int(os.environ.get("RECORD_MAX_SIDE", "640")),
+        help="写入视频前将图像等比缩放到最大边（像素）。默认 640。",
+    )
+    parser.add_argument(
+        "--record-include-top",
+        type=int,
+        default=int(os.environ.get("RECORD_INCLUDE_TOP", "1")),
+        choices=[0, 1],
+        help="mp4 是否合并鸟瞰图（0/1）。默认 1。",
+    )
     return parser.parse_args()
+
+
+def _resize_for_record(img: Image.Image, max_side: int) -> Image.Image:
+    """等比缩放，用于录制时降低体积。"""
+    w, h = img.size
+    scale = max(w, h) / float(max_side) if max(w, h) > max_side else 1.0
+    if scale > 1.0:
+        return img.resize((int(w / scale), int(h / scale)), Image.BICUBIC)
+    return img
+
+
+def _pad_to_multiple(img: Image.Image, m: int = 16) -> Image.Image:
+    """把图像 pad 到宽高均为 m 的倍数，避免编码器自动 resize。"""
+    w, h = img.size
+    new_w = int(np.ceil(w / m) * m)
+    new_h = int(np.ceil(h / m) * m)
+    if new_w == w and new_h == h:
+        return img
+    out = Image.new("RGB", (new_w, new_h), (0, 0, 0))
+    out.paste(img, (0, 0))
+    return out
 
 
 # HTTP 相机最新一帧 JPEG（前向视角 & 鸟瞰视角）
@@ -367,13 +421,47 @@ def main(args: argparse.Namespace):
     camera_top = None
     http_server: HTTPServer | None = None
     http_thread: threading.Thread | None = None
+    http_port_in_use = int(getattr(args, "http_port", 8080))
+
+    # ===== 录制 mp4：提前定义，避免异常路径下 finally 引用未赋值变量 =====
+    record_enabled = bool(getattr(args, "record_mp4", 0))
+    record_every_n = max(int(getattr(args, "record_every_n", 2)), 1)
+    record_max_side = max(int(getattr(args, "record_max_side", 640)), 64)
+    record_include_top = bool(getattr(args, "record_include_top", 1))
+    record_writer = None
+    record_path = None
 
     try:
         # 启动 HTTP 服务器，用浏览器可视化相机画面
-        http_server = HTTPServer(("0.0.0.0", 8080), CameraHTTPHandler)
+        class _ReusableHTTPServer(HTTPServer):
+            allow_reuse_address = True
+
+        def _try_bind_http_server(
+            start_port: int, max_tries: int = 20
+        ) -> tuple[HTTPServer, int]:
+            """
+            绑定 HTTP 端口。如果端口被占用（常见于上次 ^Z 挂起或异常退出），
+            则自动尝试后续端口：start_port, start_port+1, ...
+            """
+            last_err: OSError | None = None
+            for p in range(start_port, start_port + max_tries):
+                try:
+                    srv = _ReusableHTTPServer(("0.0.0.0", int(p)), CameraHTTPHandler)
+                    return srv, int(p)
+                except OSError as e:
+                    last_err = e
+                    if getattr(e, "errno", None) == 98:
+                        continue
+                    raise
+            raise OSError(
+                f"Failed to bind HTTP server starting at port {start_port} "
+                f"(tried {max_tries} ports). Last error: {last_err!r}"
+            )
+
+        http_server, http_port_in_use = _try_bind_http_server(int(args.http_port))
         http_thread = threading.Thread(target=http_server.serve_forever, daemon=True)
         http_thread.start()
-        print("HTTP camera server running on http://localhost:8080")
+        print(f"HTTP camera server running on http://localhost:{http_port_in_use}")
 
         # 切换为同步模式，固定时间步长
         settings = world.get_settings()
@@ -536,6 +624,14 @@ def main(args: argparse.Namespace):
         running = True
         frame_count = 0
         dt = settings.fixed_delta_seconds or 0.05
+        sim_fps = float(1.0 / dt) if dt > 1e-6 else 20.0
+
+        # ===== 录制 mp4（依赖 conda 环境中的 ffmpeg）=====
+        if record_enabled:
+            out_dir = Path(__file__).resolve().parents[2] / "output"
+            out_dir.mkdir(parents=True, exist_ok=True)
+            run_id = time.strftime("%Y%m%d-%H%M%S")
+            record_path = out_dir / f"sim_{run_id}.mp4"
 
         # AV 控制模式（可通过命令行或环境变量配置）：
         # - cruise：简易巡航（默认）
@@ -788,6 +884,43 @@ def main(args: argparse.Namespace):
             except queue.Empty:
                 pass
 
+            # ===== 写入 mp4：合并前视 + 鸟瞰（可选）=====
+            if (
+                record_enabled
+                and record_path is not None
+                and (frame_count % record_every_n == 0)
+                and latest_pil_front is not None
+            ):
+                try:
+                    # 延迟导入，避免非录制模式额外依赖
+                    import imageio.v2 as imageio  # type: ignore
+
+                    f_img = _resize_for_record(latest_pil_front.convert("RGB"), record_max_side)
+                    if record_include_top and latest_pil_top is not None:
+                        t_img = _resize_for_record(latest_pil_top.convert("RGB"), record_max_side)
+                        # 对齐高度后水平拼接
+                        if t_img.size[1] != f_img.size[1]:
+                            t_img = t_img.resize((t_img.size[0], f_img.size[1]), Image.BICUBIC)
+                        merged = Image.new("RGB", (f_img.size[0] + t_img.size[0], f_img.size[1]))
+                        merged.paste(f_img, (0, 0))
+                        merged.paste(t_img, (f_img.size[0], 0))
+                    else:
+                        merged = f_img
+
+                    merged = _pad_to_multiple(merged, 16)
+                    if record_writer is None:
+                        fps_out = sim_fps / float(record_every_n)
+                        record_writer = imageio.get_writer(
+                            str(record_path),
+                            fps=fps_out,
+                            codec="libx264",
+                            quality=8,
+                        )
+                    record_writer.append_data(np.asarray(merged))
+                except Exception as e:
+                    print("[record] mp4 write failed:", repr(e))
+                    record_enabled = False  # 避免刷屏
+
             # drivevla_live：在拿到最新相机帧后做一次推理，供下一轮使用
             if av_mode == "drivevla_live" and drivevla_policy is not None:
                 try:
@@ -856,6 +989,14 @@ def main(args: argparse.Namespace):
         print("*"*20,"仿真结束","*"*20)
 
     finally:
+        # 关闭录制器并打印输出路径
+        try:
+            if record_writer is not None:
+                record_writer.close()
+                print(f"[record] saved mp4: {record_path}")
+        except Exception as e:
+            print("[record] finalize failed:", repr(e))
+
         # 停止相机并销毁 actor，恢复仿真设置
         if camera_front is not None:
             camera_front.stop()
@@ -873,7 +1014,13 @@ def main(args: argparse.Namespace):
                 hv.destroy()
 
         if http_server is not None:
-            http_server.shutdown()
+            try:
+                http_server.shutdown()
+            finally:
+                # 彻底释放端口；仅 shutdown 可能仍让端口处于占用/WAIT 状态
+                http_server.server_close()
+        if http_thread is not None and http_thread.is_alive():
+            http_thread.join(timeout=1.0)
 
         try:
             world.apply_settings(original_settings)
