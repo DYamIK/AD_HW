@@ -1,10 +1,6 @@
 ## 项目记录：基于 CARLA 0.9.16 的自动驾驶换道决策与轨迹规划作业
-
-> 路径：`/data1/daiyukun/小学一下/AutoDriving/AD_HW/carla_lane_change_notes.md`  
-> 作用：后续在本项目中继续实现、调试和写报告时，都优先参考本记录。
-
 ---
-cd /data1/daiyukun/小学一下/AutoDriving/AD_HW/carla_0.9.16
+cd ./carla_0.9.16
 ./CarlaUE4.sh -RenderOffScreen
 conda activate drivevla
 python /data1/daiyukun/小学一下/AutoDriving/AD_HW/code/simulator/main.py
